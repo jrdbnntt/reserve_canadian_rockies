@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta
+
+import selenium.common.exceptions
 from pytz import timezone
 from dateutil.relativedelta import relativedelta
 from selenium.webdriver.remote.webdriver import WebDriver, WebElement
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException, ElementClickInterceptedException, MoveTargetOutOfBoundsException
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver import Keys
 from selenium.webdriver.support import expected_conditions
 from selenium.webdriver.common.by import By
 
@@ -50,33 +54,74 @@ def build_url_create_booking_page(
     )
 
 
+class FormError(Exception):
+    _ERROR_MESSAGE_NOT_YET_READY = 'Reserving these dates is not yet allowed.'
+
+    def __init__(self, message: str):
+        super().__init__(message.strip())
+
+    def is_not_ready(self) -> bool:
+        return self.message.startswith(FormError._ERROR_MESSAGE_NOT_YET_READY)
+
+
 class WebReservationAutomator:
     """
     Automates saving reservations to a cart on the BC Parks website. Once a reservation has been saved to cart
     successfully, it should be manually purchased in the browser this program opens.
     """
 
+    # Other paths.
+    _XPATH_CONSENT_BTN = '//button[@id="consentButton"]'
+    _XPATH_RESERVATION_DETAILS_PAGE_TITLE = '//h1[@id="pageTitle" and contains(./text(), "Review Reservation Details")]'
+
+    # Search form paths.
     _XPATH_SEARCH_FORM = '//app-search-criteria/div/form/mat-tab-group/div/mat-tab-body[4]'
     _XPATH_SEARCH_BTN = "//div/div/fieldset/div[2]/button"
     _XPATH_PARTY_SIZE_INPUT = '//app-number-stepper-control[@controlid="party-size-field"]/div/div/mat-form-field/div/div[1]/div[3]/input'
     _XPATH_TENT_PADS_INPUT = '//app-number-stepper-control[@controlid="equipment-capacity-field"]/div/div/mat-form-field/div/div[1]/div[3]/input'
 
+    # Build your stay form paths.
+    _XPATH_BUILD_YOUR_STAY_FORM = '//app-build-your-stay/div/form'
+    _XPATH_NIGHTS_INPUT = '//input[@id="itinerary-nights-field-1"]'
+    _XPATH_AVAILABLE_AREAS_INPUT = '//input[@id="itinerary-blocker-autocomplete"]'
+    _XPATH_AVAILABLE_AREAS_OPTION_FORMAT = '//mat-option[contains(.//span[@class="mat-option-text"], "{}")]'
+    _XPATH_ERROR_MESSAGE_SPAN = '//mat-error/span'
+    _XPATH_SAVE_RESERVATION_BTN = '//button[@id="addToItineraryButton"]'
+    _XPATH_RESERVE_BTN = '//button[@id="reserve-itinerary-btn"]'
+    _XPATH_ITINERARY_ITEM = '//app-itinerary-blocker-item[contains(@class, "itinerary-row")]'
+
     def __init__(self, driver: WebDriver):
         self.driver = driver
 
-    def open_create_booking_page(self, start_date: datetime = None, **kwargs):
+    def move_to_and_click_element(self, element :WebElement):
+        ActionChains(self.driver).move_to_element(element).click(element).perform()
+
+    def open_create_booking_page(self, start_date: str = None, **kwargs):
         """
         Launch browser and open the page.
         """
+        # Resolve start date
         if start_date is None:
-            start_date = next_possible_available_start_date()
-        page_url = build_url_create_booking_page(start_date=start_date, **kwargs)
-        self.driver.get(page_url)
-        WebDriverWait(self.driver, 10).until(self.find_search_btn)
+            start_date_dt = next_possible_available_start_date()
+        else:
+            start_date_dt = RESERVATION_CHECK_TZ.localize(datetime.strptime(start_date, "%Y-%m-%d"))
 
-    @staticmethod
-    def find_search_btn(driver: WebDriver) -> WebElement:
-        return driver.find_element(By.XPATH, WebReservationAutomator._XPATH_SEARCH_FORM).find_element(By.XPATH, WebReservationAutomator._XPATH_SEARCH_BTN)
+        # Load page.
+        page_url = build_url_create_booking_page(start_date=start_date_dt, **kwargs)
+        self.driver.get(page_url)
+
+        # Wait for page to load search form.
+        def find_search_btn(driver: WebDriver) -> WebElement:
+            return driver\
+                .find_element(By.XPATH, WebReservationAutomator._XPATH_SEARCH_FORM)\
+                .find_element(By.XPATH, WebReservationAutomator._XPATH_SEARCH_BTN)
+        WebDriverWait(self.driver, 10).until(find_search_btn)
+
+        # Get the consent button out of the way if it's there.
+        try:
+            self.driver.find_element(By.XPATH, WebReservationAutomator._XPATH_CONSENT_BTN).click()
+        except Exception:
+            pass
 
     def fill_options_and_search(self, party_size: int, tent_pads: int = 1):
         """
@@ -91,16 +136,21 @@ class WebReservationAutomator:
         tent_pads_input = search_form.find_element(By.XPATH, WebReservationAutomator._XPATH_TENT_PADS_INPUT)
 
         # Input party size.
-        party_size_input.clear()
+        self.move_to_and_click_element(party_size_input)
+        party_size_input.send_keys(Keys.BACKSPACE)
         party_size_input.send_keys(str(party_size))
 
         # Input tent pads amount.
-        tent_pads_input.clear()
+        self.move_to_and_click_element(tent_pads_input)
+        tent_pads_input.send_keys(Keys.BACKSPACE)
         tent_pads_input.send_keys(str(tent_pads))
 
         # Click search to submit form.
-        search_btn.click()
+        self.move_to_and_click_element(search_btn)
 
+        # Wait for results to appear.
+        WebDriverWait(self.driver, 10)\
+            .until(lambda d: d.find_element(By.XPATH, WebReservationAutomator._XPATH_BUILD_YOUR_STAY_FORM))
 
     def save_reservation(self, nights: int, area: str):
         """
@@ -109,4 +159,78 @@ class WebReservationAutomator:
         expected that the reservation should be saved in the cart for 15 minutes and is ready for manual user checkout,
         which should be done ASAP to avoid potential checkout timeout/duplication on the BC Parks' end.
         """
-        pass
+        poll_frequency = .1
+
+        # Find elements
+        build_your_stay_form = self.driver.find_element(By.XPATH, WebReservationAutomator._XPATH_BUILD_YOUR_STAY_FORM)
+        nights_input = build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_NIGHTS_INPUT)
+        area_input = build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_AVAILABLE_AREAS_INPUT)
+        save_btn = build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_SAVE_RESERVATION_BTN)
+        reserve_btn = build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_RESERVE_BTN)
+
+        # Input nights.
+        nights_input.clear()
+        nights_input.send_keys(str(nights))
+
+        # Input area.
+        area_input.clear()
+        self.move_to_and_click_element(area_input)
+
+        area_option = None
+
+        def find_area_option(d):
+            nonlocal area_option
+            area_option = d.find_element(By.XPATH, WebReservationAutomator._XPATH_AVAILABLE_AREAS_OPTION_FORMAT.format(area))
+            return area_option
+        try:
+            WebDriverWait(self.driver, 2, poll_frequency=poll_frequency).until(find_area_option)
+        except TimeoutException as e:
+            raise Exception('Failed to find area option element for "{}"'.format(area)) from e
+        if isinstance(area_option, WebElement):
+            self.move_to_and_click_element(area_option)
+        else:
+            raise Exception('area_option not set by WebDriverWait')
+
+        # Check for error message. One will appear if it's too early or there is no availability.
+        self.check_for_build_your_stay_error(build_your_stay_form)
+
+        # So far so good, let's try to save the reservation.
+        self.move_to_and_click_element(save_btn)
+        self.check_for_build_your_stay_error(build_your_stay_form)
+
+        reserve_err = None
+
+        def form_error_or_itinerary_item_found(d):
+            nonlocal reserve_err
+            try:
+                self.check_for_build_your_stay_error(build_your_stay_form)
+                return build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_ITINERARY_ITEM)
+            except FormError as er:
+                reserve_err = er
+
+        WebDriverWait(self.driver, 2, poll_frequency=poll_frequency).until(form_error_or_itinerary_item_found)
+        if reserve_err is not None:
+            raise reserve_err
+
+        def wait_for_reservation_confirmation(d):
+            try:
+                return d.find_element(By.XPATH, WebReservationAutomator._XPATH_RESERVATION_DETAILS_PAGE_TITLE)
+            except NoSuchElementException:
+                pass
+            try:
+                self.move_to_and_click_element(reserve_btn)
+            except (StaleElementReferenceException, ElementClickInterceptedException, MoveTargetOutOfBoundsException):
+                pass
+
+        WebDriverWait(self.driver, 3, poll_frequency=poll_frequency).until(wait_for_reservation_confirmation)
+
+    @staticmethod
+    def check_for_build_your_stay_error(build_your_stay_form: WebElement):
+        error_message = None
+        try:
+            error_message_span = build_your_stay_form.find_element(By.XPATH, WebReservationAutomator._XPATH_ERROR_MESSAGE_SPAN)
+            error_message = error_message_span.text
+        except Exception:
+            pass
+        if error_message is not None:
+            raise FormError(message=error_message)
